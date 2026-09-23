@@ -1,0 +1,107 @@
+#include <esp_now.h>
+#include <WiFi.h>
+
+const int ledLeft = 4;
+const int ledRight = 6;
+const int ledLamp = 7; 
+
+// We use the exact same 'struct' as the sender so the received data maps perfectly.
+typedef struct control_message {
+  bool clickLeft;
+  bool clickRight;
+  bool clickCancel;
+  bool clickLamp;
+  bool clickHazard;
+} control_message;
+
+control_message receivedData;
+
+// We use an 'enum' to define and name the possible states for the turn signals. 
+// This makes the code much easier to read and manage than using random numbers.
+enum TurnSignalState { OFF, LEFT, RIGHT, HAZARD };
+TurnSignalState currentState = OFF; 
+
+bool isLampOn = false; 
+
+// Variables for the timer. We use 'unsigned long' because millis() gets very large quickly.
+// This replaces delay() so the ESP32 can continuously listen for new messages while blinking.
+unsigned long previousTime = 0;
+const long blinkInterval = 400; // Blink speed in milliseconds
+bool flashState = false; // Alternates between HIGH (on) and LOW (off)
+
+// This function runs automatically in the background whenever a new ESP-NOW message arrives.
+void onDataReceived(const esp_now_recv_info_t * info, const uint8_t *data, int len) {
+  // Copy the incoming raw data into our structured variable
+  memcpy(&receivedData, data, sizeof(receivedData));
+
+  // Change the current state based on which button was pressed
+  if (receivedData.clickLeft) currentState = LEFT;
+  if (receivedData.clickRight) currentState = RIGHT;
+  if (receivedData.clickCancel) currentState = OFF;
+  
+  if (receivedData.clickLamp) {
+    isLampOn = !isLampOn; // Toggle state: if it was off, it turns on, and vice versa
+  }
+  
+  if (receivedData.clickHazard) {
+    if (currentState == HAZARD) {
+      currentState = OFF; // Turn off if it was already blinking hazard
+    } else {
+      currentState = HAZARD; // Otherwise, turn hazard on
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  pinMode(ledLeft, OUTPUT);
+  pinMode(ledRight, OUTPUT);
+  pinMode(ledLamp, OUTPUT);
+  
+  digitalWrite(ledLeft, LOW);
+  digitalWrite(ledRight, LOW);
+  digitalWrite(ledLamp, LOW);
+
+  WiFi.mode(WIFI_MODE_STA);
+  esp_now_init();
+  esp_now_register_recv_cb(onDataReceived);
+}
+
+void loop() {
+  // 1. STEADY LAMP CONTROL (Completely independent from the blinking logic)
+  digitalWrite(ledLamp, isLampOn ? HIGH : LOW);
+
+  // 2. BLINKING CONTROL USING A TIMER (Non-blocking logic)
+  // millis() returns the number of milliseconds since the board began running the program.
+  unsigned long currentTime = millis(); 
+  
+  // Check if enough time (blinkInterval) has passed since the last change
+  if (currentTime - previousTime >= blinkInterval) 
+  {
+    previousTime = currentTime; // Reset the stopwatch
+    flashState = !flashState; // Toggle between on and off
+
+    // Depending on the current state, apply the flash to the correct LEDs
+    if (currentState == LEFT) 
+    {
+      digitalWrite(ledLeft, flashState);
+      digitalWrite(ledRight, LOW); // Ensure the other LED stays off
+    } 
+    else if (currentState == RIGHT) 
+    {
+      digitalWrite(ledLeft, LOW); 
+      digitalWrite(ledRight, flashState);
+    } 
+    else if (currentState == HAZARD) 
+    {
+      digitalWrite(ledLeft, flashState);
+      digitalWrite(ledRight, flashState);
+    } 
+    else if (currentState == OFF) 
+    {
+      digitalWrite(ledLeft, LOW);
+      digitalWrite(ledRight, LOW);
+    }
+  }
+}
