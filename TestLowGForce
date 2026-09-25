@@ -1,0 +1,187 @@
+#include <esp_now.h>
+#include <WiFi.h>
+#include <Wire.h>
+#include <math.h>
+
+// MPU6500 I2C Address
+const int MPU_ADDR = 0x68;
+
+// I2C Pins for ESP32-C3 Super Mini
+const int sdaPin = 10;
+const int sclPin = 9;
+
+// LED Pins
+const int ledLeft = 4;
+const int ledRight = 6;
+const int ledLamp = 7;
+const int ledStop = 21;
+
+// Buzzer Pins
+const int buzzerLeft = 5;
+const int buzzerRight = 8;
+
+// Data structure (Must match the transmitter exactly)
+typedef struct control_message {
+  bool clickLeft;
+  bool clickRight;
+  bool clickCancel;
+  bool clickLamp;
+  bool clickHazard;
+} control_message;
+
+control_message receivedData;
+
+// State machine including the new SOS state
+enum DirectionState { STATE_OFF, STATE_LEFT, STATE_RIGHT, STATE_HAZARD, STATE_SOS };
+DirectionState currentState = STATE_OFF;
+
+bool isLampOn = false;
+
+// Timer variables for blinking
+unsigned long previousTime = 0;
+const int blinkInterval = 400;
+bool flashState = false;
+
+// Thresholds for MPU6500 (Lowered for testing)
+const float BRAKE_THRESHOLD = 0.15; // Minimal movement triggers brake
+const float CRASH_THRESHOLD = 1.5;  // Moderate shake triggers SOS
+
+void onDataRecv(const esp_now_recv_info_t * info, const uint8_t *data, int len) {
+  // If we are in SOS mode, ignore all incoming wireless commands
+  if (currentState == STATE_SOS) return;
+
+  memcpy(&receivedData, data, sizeof(receivedData));
+
+  if (receivedData.clickLeft) currentState = STATE_LEFT;
+  if (receivedData.clickRight) currentState = STATE_RIGHT;
+  if (receivedData.clickCancel) currentState = STATE_OFF;
+  
+  if (receivedData.clickLamp) {
+    isLampOn = !isLampOn;
+  }
+  
+  if (receivedData.clickHazard) {
+    if (currentState == STATE_HAZARD) {
+      currentState = STATE_OFF;
+    } else {
+      currentState = STATE_HAZARD;
+    }
+  }
+}
+
+void initMPU6500() {
+  Wire.begin(sdaPin, sclPin);
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x6B); // PWR_MGMT_1 register
+  Wire.write(0);    // Wake up the MPU6500
+  Wire.endTransmission(true);
+}
+
+void readAccelData(float &gX, float &gY, float &gZ) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x3B); // ACCEL_XOUT_H register
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU_ADDR, 6, true);
+  
+  int16_t rawX = Wire.read() << 8 | Wire.read();
+  int16_t rawY = Wire.read() << 8 | Wire.read();
+  int16_t rawZ = Wire.read() << 8 | Wire.read();
+  
+  // Convert raw values to G-force (Default sensitivity is +/- 2g -> 16384 LSB/g)
+  gX = rawX / 16384.0;
+  gY = rawY / 16384.0;
+  gZ = rawZ / 16384.0;
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  pinMode(ledLeft, OUTPUT);
+  pinMode(ledRight, OUTPUT);
+  pinMode(ledLamp, OUTPUT);
+  pinMode(ledStop, OUTPUT);
+  
+  pinMode(buzzerLeft, OUTPUT);
+  pinMode(buzzerRight, OUTPUT);
+  
+  digitalWrite(ledLeft, LOW);
+  digitalWrite(ledRight, LOW);
+  digitalWrite(ledLamp, LOW);
+  digitalWrite(ledStop, LOW);
+  digitalWrite(buzzerLeft, LOW);
+  digitalWrite(buzzerRight, LOW);
+
+  initMPU6500();
+
+  WiFi.mode(WIFI_MODE_STA);
+  esp_now_init();
+  esp_now_register_recv_cb(onDataRecv);
+}
+
+void loop() {
+  // Read physical data from the accelerometer
+  float gX, gY, gZ;
+  readAccelData(gX, gY, gZ);
+
+  // 1. SOS / CRASH DETECTION LOGIC
+  // Calculate the total acceleration magnitude vector
+  float gTotal = sqrt(gX * gX + gY * gY + gZ * gZ);
+  
+  if (gTotal > CRASH_THRESHOLD) {
+    currentState = STATE_SOS;
+  }
+
+  // 2. STOP LIGHT LOGIC (Braking)
+  if (currentState != STATE_SOS) {
+    if (gY > BRAKE_THRESHOLD || gY < -BRAKE_THRESHOLD) {
+      digitalWrite(ledStop, HIGH);
+    } else {
+      digitalWrite(ledStop, LOW);
+    }
+    
+    // Normal lamp control
+    digitalWrite(ledLamp, isLampOn ? HIGH : LOW);
+  }
+
+  // 3. BLINKING AND SOUND TIMER CONTROL
+  unsigned long currentTime = millis();
+  
+  if (currentTime - previousTime >= blinkInterval) {
+    previousTime = currentTime;
+    flashState = !flashState;
+
+    if (currentState == STATE_SOS) {
+      // SOS Mode: Flash everything wildly
+      digitalWrite(ledLeft, flashState);
+      digitalWrite(ledRight, flashState);
+      digitalWrite(ledStop, flashState);
+      digitalWrite(ledLamp, flashState);
+      digitalWrite(buzzerLeft, flashState);
+      digitalWrite(buzzerRight, flashState);
+    }
+    else if (currentState == STATE_LEFT) {
+      digitalWrite(ledLeft, flashState);
+      digitalWrite(buzzerLeft, flashState);
+      digitalWrite(ledRight, LOW);
+      digitalWrite(buzzerRight, LOW);
+    }
+    else if (currentState == STATE_RIGHT) {
+      digitalWrite(ledLeft, LOW);
+      digitalWrite(buzzerLeft, LOW);
+      digitalWrite(ledRight, flashState);
+      digitalWrite(buzzerRight, flashState);
+    }
+    else if (currentState == STATE_HAZARD) {
+      digitalWrite(ledLeft, flashState);
+      digitalWrite(ledRight, flashState);
+      digitalWrite(buzzerLeft, flashState);
+      digitalWrite(buzzerRight, flashState);
+    }
+    else if (currentState == STATE_OFF) {
+      digitalWrite(ledLeft, LOW);
+      digitalWrite(ledRight, LOW);
+      digitalWrite(buzzerLeft, LOW);
+      digitalWrite(buzzerRight, LOW);
+    }
+  }
+}
