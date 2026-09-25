@@ -3,6 +3,12 @@
 #include <Wire.h>
 #include <math.h>
 
+// Librerías BLE
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
 // MPU6500 I2C Address
 const int MPU_ADDR = 0x68;
 
@@ -20,7 +26,7 @@ const int ledStop = 21;
 const int buzzerLeft = 5;
 const int buzzerRight = 8;
 
-// Data structure (Must match the transmitter exactly)
+// Data structure ESP-NOW
 typedef struct control_message {
   bool clickLeft;
   bool clickRight;
@@ -31,23 +37,51 @@ typedef struct control_message {
 
 control_message receivedData;
 
-// State machine including the new SOS state
+// State machine
 enum DirectionState { STATE_OFF, STATE_LEFT, STATE_RIGHT, STATE_HAZARD, STATE_SOS };
 DirectionState currentState = STATE_OFF;
-
 bool isLampOn = false;
 
-// Timer variables for blinking
+// Timer variables for normal blinking
 unsigned long previousTime = 0;
 const int blinkInterval = 400;
 bool flashState = false;
 
+// SOS Morse Code Variables
+const int sosPattern[] = {
+  150, 150, 150, 150, 150, 450, 
+  450, 150, 450, 150, 450, 450, 
+  150, 150, 150, 150, 150, 1400 
+};
+const int sosPatternLength = 18;
+int sosIndex = 0;
+unsigned long previousSosTime = 0;
+
 // Thresholds for MPU6500
-const float BRAKE_THRESHOLD = 0.4; // G-force required to trigger the stop light
-const float CRASH_THRESHOLD = 3.5; // Total G-force to trigger SOS mode
+const float BRAKE_THRESHOLD = 0.4; 
+const float CRASH_THRESHOLD = 2.5; 
+
+// --- VARIABLES BLE ---
+BLEServer* pServer = NULL;
+BLECharacteristic* pCharacteristic = NULL;
+bool deviceConnected = false;
+
+#define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+
+// Callback para saber si el celular se conectó o desconectó
+class MyServerCallbacks: public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) {
+      deviceConnected = true;
+    };
+    void onDisconnect(BLEServer* pServer) {
+      deviceConnected = false;
+      // Reiniciar publicidad para que el celular se pueda volver a conectar
+      BLEDevice::startAdvertising(); 
+    }
+};
 
 void onDataRecv(const esp_now_recv_info_t * info, const uint8_t *data, int len) {
-  // If we are in SOS mode, ignore all incoming wireless commands
   if (currentState == STATE_SOS) return;
 
   memcpy(&receivedData, data, sizeof(receivedData));
@@ -72,14 +106,14 @@ void onDataRecv(const esp_now_recv_info_t * info, const uint8_t *data, int len) 
 void initMPU6500() {
   Wire.begin(sdaPin, sclPin);
   Wire.beginTransmission(MPU_ADDR);
-  Wire.write(0x6B); // PWR_MGMT_1 register
-  Wire.write(0);    // Wake up the MPU6500
+  Wire.write(0x6B); 
+  Wire.write(0);    
   Wire.endTransmission(true);
 }
 
 void readAccelData(float &gX, float &gY, float &gZ) {
   Wire.beginTransmission(MPU_ADDR);
-  Wire.write(0x3B); // ACCEL_XOUT_H register
+  Wire.write(0x3B); 
   Wire.endTransmission(false);
   Wire.requestFrom(MPU_ADDR, 6, true);
   
@@ -87,7 +121,6 @@ void readAccelData(float &gX, float &gY, float &gZ) {
   int16_t rawY = Wire.read() << 8 | Wire.read();
   int16_t rawZ = Wire.read() << 8 | Wire.read();
   
-  // Convert raw values to G-force (Default sensitivity is +/- 2g -> 16384 LSB/g)
   gX = rawX / 16384.0;
   gY = rawY / 16384.0;
   gZ = rawZ / 16384.0;
@@ -100,7 +133,6 @@ void setup() {
   pinMode(ledRight, OUTPUT);
   pinMode(ledLamp, OUTPUT);
   pinMode(ledStop, OUTPUT);
-  
   pinMode(buzzerLeft, OUTPUT);
   pinMode(buzzerRight, OUTPUT);
   
@@ -116,74 +148,112 @@ void setup() {
   WiFi.mode(WIFI_MODE_STA);
   esp_now_init();
   esp_now_register_recv_cb(onDataRecv);
+
+  // --- INICIALIZACIÓN BLE ---
+  BLEDevice::init("EL4X-ESP32-C3");
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+
+  pCharacteristic = pService->createCharacteristic(
+                      CHARACTERISTIC_UUID,
+                      BLECharacteristic::PROPERTY_READ   |
+                      BLECharacteristic::PROPERTY_NOTIFY
+                    );
+
+  // Descriptor necesario para que el celular reciba notificaciones push
+  pCharacteristic->addDescriptor(new BLE2902());
+
+  pService->start();
+  
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(true);
+  pAdvertising->setMinPreferred(0x06); 
+  pAdvertising->setMinPreferred(0x12);
+  BLEDevice::startAdvertising();
 }
 
 void loop() {
-  // Read physical data from the accelerometer
   float gX, gY, gZ;
   readAccelData(gX, gY, gZ);
 
-  // 1. SOS / CRASH DETECTION LOGIC
-  // Calculate the total acceleration magnitude vector
   float gTotal = sqrt(gX * gX + gY * gY + gZ * gZ);
   
+  // 1. SOS / CRASH DETECTION LOGIC
   if (gTotal > CRASH_THRESHOLD) {
-    currentState = STATE_SOS;
+    if (currentState != STATE_SOS) {
+      currentState = STATE_SOS;
+      sosIndex = 0; 
+      previousSosTime = millis();
+
+      // --- ENVIAR ALERTA BLE AL CELULAR ---
+      if (deviceConnected) {
+        pCharacteristic->setValue("CRASH");
+        pCharacteristic->notify(); // Dispara la notificación en la app
+      }
+    }
   }
 
-  // 2. STOP LIGHT LOGIC (Braking)
-  // Assuming the Y-axis points forward/backward on the helmet.
-  // If the module is mounted differently, change 'gY' to 'gX' or 'gZ'.
+  // 2. STOP LIGHT LOGIC
   if (currentState != STATE_SOS) {
     if (gY > BRAKE_THRESHOLD || gY < -BRAKE_THRESHOLD) {
       digitalWrite(ledStop, HIGH);
     } else {
       digitalWrite(ledStop, LOW);
     }
-    
-    // Normal lamp control
     digitalWrite(ledLamp, isLampOn ? HIGH : LOW);
   }
 
   // 3. BLINKING AND SOUND TIMER CONTROL
   unsigned long currentTime = millis();
   
-  if (currentTime - previousTime >= blinkInterval) {
-    previousTime = currentTime;
-    flashState = !flashState;
+  if (currentState == STATE_SOS) {
+    if (currentTime - previousSosTime >= sosPattern[sosIndex]) {
+      previousSosTime = currentTime;
+      sosIndex++;
+      if (sosIndex >= sosPatternLength) sosIndex = 0; 
+    }
+    
+    bool currentSosState = (sosIndex % 2 == 0); 
+    
+    digitalWrite(ledLeft, currentSosState);
+    digitalWrite(ledRight, currentSosState);
+    digitalWrite(ledStop, currentSosState);
+    digitalWrite(ledLamp, currentSosState);
+    digitalWrite(buzzerLeft, currentSosState);
+    digitalWrite(buzzerRight, currentSosState);
+    
+  } else {
+    if (currentTime - previousTime >= blinkInterval) {
+      previousTime = currentTime;
+      flashState = !flashState;
 
-    if (currentState == STATE_SOS) {
-      // SOS Mode: Flash everything wildly
-      digitalWrite(ledLeft, flashState);
-      digitalWrite(ledRight, flashState);
-      digitalWrite(ledStop, flashState);
-      digitalWrite(ledLamp, flashState);
-      digitalWrite(buzzerLeft, flashState);
-      digitalWrite(buzzerRight, flashState);
-    }
-    else if (currentState == STATE_LEFT) {
-      digitalWrite(ledLeft, flashState);
-      digitalWrite(buzzerLeft, flashState);
-      digitalWrite(ledRight, LOW);
-      digitalWrite(buzzerRight, LOW);
-    }
-    else if (currentState == STATE_RIGHT) {
-      digitalWrite(ledLeft, LOW);
-      digitalWrite(buzzerLeft, LOW);
-      digitalWrite(ledRight, flashState);
-      digitalWrite(buzzerRight, flashState);
-    }
-    else if (currentState == STATE_HAZARD) {
-      digitalWrite(ledLeft, flashState);
-      digitalWrite(ledRight, flashState);
-      digitalWrite(buzzerLeft, flashState);
-      digitalWrite(buzzerRight, flashState);
-    }
-    else if (currentState == STATE_OFF) {
-      digitalWrite(ledLeft, LOW);
-      digitalWrite(ledRight, LOW);
-      digitalWrite(buzzerLeft, LOW);
-      digitalWrite(buzzerRight, LOW);
+      if (currentState == STATE_LEFT) {
+        digitalWrite(ledLeft, flashState);
+        digitalWrite(buzzerLeft, flashState);
+        digitalWrite(ledRight, LOW);
+        digitalWrite(buzzerRight, LOW);
+      }
+      else if (currentState == STATE_RIGHT) {
+        digitalWrite(ledLeft, LOW);
+        digitalWrite(buzzerLeft, LOW);
+        digitalWrite(ledRight, flashState);
+        digitalWrite(buzzerRight, flashState);
+      }
+      else if (currentState == STATE_HAZARD) {
+        digitalWrite(ledLeft, flashState);
+        digitalWrite(ledRight, flashState);
+        digitalWrite(buzzerLeft, flashState);
+        digitalWrite(buzzerRight, flashState);
+      }
+      else if (currentState == STATE_OFF) {
+        digitalWrite(ledLeft, LOW);
+        digitalWrite(ledRight, LOW);
+        digitalWrite(buzzerLeft, LOW);
+        digitalWrite(buzzerRight, LOW);
+      }
     }
   }
 }
