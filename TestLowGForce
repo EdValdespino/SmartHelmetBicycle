@@ -54,9 +54,9 @@ const int sosPatternLength = 18;
 int sosIndex = 0;
 unsigned long previousSosTime = 0;
 
-// Thresholds for MPU6500 (Test values)
-const float BRAKE_THRESHOLD = 0.15;
-const float CRASH_THRESHOLD = 1.5;
+// Thresholds for MPU6500 (Restored to real-world values)
+const float BRAKE_THRESHOLD = 0.4; // Original working value for brake
+const float CRASH_THRESHOLD = 2.5; // Requires a real hard impact to trigger SOS
 
 void onDataRecv(const esp_now_recv_info_t * info, const uint8_t *data, int len) {
   // If we are in SOS mode, ignore all incoming wireless commands
