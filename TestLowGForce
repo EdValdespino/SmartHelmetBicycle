@@ -31,20 +31,32 @@ typedef struct control_message {
 
 control_message receivedData;
 
-// State machine including the new SOS state
+// State machine including the SOS state
 enum DirectionState { STATE_OFF, STATE_LEFT, STATE_RIGHT, STATE_HAZARD, STATE_SOS };
 DirectionState currentState = STATE_OFF;
 
 bool isLampOn = false;
 
-// Timer variables for blinking
+// Timer variables for normal blinking
 unsigned long previousTime = 0;
 const int blinkInterval = 400;
 bool flashState = false;
 
-// Thresholds for MPU6500 (Lowered for testing)
-const float BRAKE_THRESHOLD = 0.15; // Minimal movement triggers brake
-const float CRASH_THRESHOLD = 1.5;  // Moderate shake triggers SOS
+// SOS Morse Code Variables
+// Pattern: S (...) O (---) S (...)
+// Even indices are ON times, Odd indices are OFF times (in milliseconds)
+const int sosPattern[] = {
+  150, 150, 150, 150, 150, 450, // S: 3 short flashes + letter gap
+  450, 150, 450, 150, 450, 450, // O: 3 long flashes + letter gap
+  150, 150, 150, 150, 150, 1400 // S: 3 short flashes + word gap
+};
+const int sosPatternLength = 18;
+int sosIndex = 0;
+unsigned long previousSosTime = 0;
+
+// Thresholds for MPU6500 (Test values)
+const float BRAKE_THRESHOLD = 0.15;
+const float CRASH_THRESHOLD = 1.5;
 
 void onDataRecv(const esp_now_recv_info_t * info, const uint8_t *data, int len) {
   // If we are in SOS mode, ignore all incoming wireless commands
@@ -124,11 +136,15 @@ void loop() {
   readAccelData(gX, gY, gZ);
 
   // 1. SOS / CRASH DETECTION LOGIC
-  // Calculate the total acceleration magnitude vector
   float gTotal = sqrt(gX * gX + gY * gY + gZ * gZ);
   
   if (gTotal > CRASH_THRESHOLD) {
-    currentState = STATE_SOS;
+    // Lock into SOS state
+    if (currentState != STATE_SOS) {
+      currentState = STATE_SOS;
+      sosIndex = 0; // Reset SOS sequence
+      previousSosTime = millis();
+    }
   }
 
   // 2. STOP LIGHT LOGIC (Braking)
@@ -146,42 +162,57 @@ void loop() {
   // 3. BLINKING AND SOUND TIMER CONTROL
   unsigned long currentTime = millis();
   
-  if (currentTime - previousTime >= blinkInterval) {
-    previousTime = currentTime;
-    flashState = !flashState;
+  if (currentState == STATE_SOS) {
+    // SOS Morse Code Sequence Execution
+    if (currentTime - previousSosTime >= sosPattern[sosIndex]) {
+      previousSosTime = currentTime;
+      sosIndex++;
+      
+      if (sosIndex >= sosPatternLength) {
+        sosIndex = 0; // Loop the SOS sequence
+      }
+    }
+    
+    // Even indices (0, 2, 4...) are ON states, Odd indices (1, 3, 5...) are OFF states
+    bool currentSosState = (sosIndex % 2 == 0); 
+    
+    digitalWrite(ledLeft, currentSosState);
+    digitalWrite(ledRight, currentSosState);
+    digitalWrite(ledStop, currentSosState);
+    digitalWrite(ledLamp, currentSosState);
+    digitalWrite(buzzerLeft, currentSosState);
+    digitalWrite(buzzerRight, currentSosState);
+    
+  } else {
+    // Normal directional blinking logic
+    if (currentTime - previousTime >= blinkInterval) {
+      previousTime = currentTime;
+      flashState = !flashState;
 
-    if (currentState == STATE_SOS) {
-      // SOS Mode: Flash everything wildly
-      digitalWrite(ledLeft, flashState);
-      digitalWrite(ledRight, flashState);
-      digitalWrite(ledStop, flashState);
-      digitalWrite(ledLamp, flashState);
-      digitalWrite(buzzerLeft, flashState);
-      digitalWrite(buzzerRight, flashState);
-    }
-    else if (currentState == STATE_LEFT) {
-      digitalWrite(ledLeft, flashState);
-      digitalWrite(buzzerLeft, flashState);
-      digitalWrite(ledRight, LOW);
-      digitalWrite(buzzerRight, LOW);
-    }
-    else if (currentState == STATE_RIGHT) {
-      digitalWrite(ledLeft, LOW);
-      digitalWrite(buzzerLeft, LOW);
-      digitalWrite(ledRight, flashState);
-      digitalWrite(buzzerRight, flashState);
-    }
-    else if (currentState == STATE_HAZARD) {
-      digitalWrite(ledLeft, flashState);
-      digitalWrite(ledRight, flashState);
-      digitalWrite(buzzerLeft, flashState);
-      digitalWrite(buzzerRight, flashState);
-    }
-    else if (currentState == STATE_OFF) {
-      digitalWrite(ledLeft, LOW);
-      digitalWrite(ledRight, LOW);
-      digitalWrite(buzzerLeft, LOW);
-      digitalWrite(buzzerRight, LOW);
+      if (currentState == STATE_LEFT) {
+        digitalWrite(ledLeft, flashState);
+        digitalWrite(buzzerLeft, flashState);
+        digitalWrite(ledRight, LOW);
+        digitalWrite(buzzerRight, LOW);
+      }
+      else if (currentState == STATE_RIGHT) {
+        digitalWrite(ledLeft, LOW);
+        digitalWrite(buzzerLeft, LOW);
+        digitalWrite(ledRight, flashState);
+        digitalWrite(buzzerRight, flashState);
+      }
+      else if (currentState == STATE_HAZARD) {
+        digitalWrite(ledLeft, flashState);
+        digitalWrite(ledRight, flashState);
+        digitalWrite(buzzerLeft, flashState);
+        digitalWrite(buzzerRight, flashState);
+      }
+      else if (currentState == STATE_OFF) {
+        digitalWrite(ledLeft, LOW);
+        digitalWrite(ledRight, LOW);
+        digitalWrite(buzzerLeft, LOW);
+        digitalWrite(buzzerRight, LOW);
+      }
     }
   }
 }
