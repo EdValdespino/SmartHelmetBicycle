@@ -3,11 +3,12 @@
 #include <Wire.h>
 #include <math.h>
 
-// Librerías BLE
+// BLE Libraries
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#include <string>
 
 // MPU6500 I2C Address
 const int MPU_ADDR = 0x68;
@@ -26,7 +27,7 @@ const int ledStop = 21;
 const int buzzerLeft = 5;
 const int buzzerRight = 8;
 
-// Data structure ESP-NOW
+// Data structure (Must match the transmitter exactly)
 typedef struct control_message {
   bool clickLeft;
   bool clickRight;
@@ -37,9 +38,10 @@ typedef struct control_message {
 
 control_message receivedData;
 
-// State machine
+// State machine including the SOS state
 enum DirectionState { STATE_OFF, STATE_LEFT, STATE_RIGHT, STATE_HAZARD, STATE_SOS };
 DirectionState currentState = STATE_OFF;
+
 bool isLampOn = false;
 
 // Timer variables for normal blinking
@@ -48,10 +50,12 @@ const int blinkInterval = 400;
 bool flashState = false;
 
 // SOS Morse Code Variables
+// Pattern: S (...) O (---) S (...)
+// Even indices are ON times, Odd indices are OFF times (in milliseconds)
 const int sosPattern[] = {
-  150, 150, 150, 150, 150, 450, 
-  450, 150, 450, 150, 450, 450, 
-  150, 150, 150, 150, 150, 1400 
+  150, 150, 150, 150, 150, 450, // S: 3 short flashes + letter gap
+  450, 150, 450, 150, 450, 450, // O: 3 long flashes + letter gap
+  150, 150, 150, 150, 150, 1400 // S: 3 short flashes + word gap
 };
 const int sosPatternLength = 18;
 int sosIndex = 0;
@@ -61,7 +65,7 @@ unsigned long previousSosTime = 0;
 const float BRAKE_THRESHOLD = 0.4; 
 const float CRASH_THRESHOLD = 2.5; 
 
-// --- VARIABLES BLE ---
+// --- BLE VARIABLES ---
 BLEServer* pServer = NULL;
 BLECharacteristic* pCharacteristic = NULL;
 bool deviceConnected = false;
@@ -69,23 +73,53 @@ bool deviceConnected = false;
 #define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 
-// Callback para saber si el celular se conectó o desconectó
+// BLE Connection Callbacks
 class MyServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) {
       deviceConnected = true;
+      Serial.println("BLE: Mobile device connected");
     };
     void onDisconnect(BLEServer* pServer) {
       deviceConnected = false;
-      // Reiniciar publicidad para que el celular se pueda volver a conectar
-      BLEDevice::startAdvertising(); 
+      Serial.println("BLE: Mobile device disconnected");
+      BLEDevice::startAdvertising(); // Restart advertising to allow reconnection
     }
 };
 
-void onDataRecv(const esp_now_recv_info_t * info, const uint8_t *data, int len) {
-  if (currentState == STATE_SOS) return;
+// BLE Incoming Data Callbacks (From Mobile App)
+class MyCharacteristicCallbacks: public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *pChar) {
+      String rxValue = pChar->getValue();
+      
+      if (rxValue.length() > 0) {
+        // Check if the received message contains the cancellation command
+        if (rxValue.indexOf("CANCEL_ALARM") != -1) {
+          if (currentState == STATE_SOS) {
+            currentState = STATE_OFF; // Cancel SOS and turn off lights/buzzers
+            Serial.println("SOS Cancelled via Mobile App");
+          }
+        }
+      }
+    }
+};
 
+// ESP-NOW Receive Callback (From Remote Control)
+void onDataRecv(const esp_now_recv_info_t * info, const uint8_t *data, int len) {
   memcpy(&receivedData, data, sizeof(receivedData));
 
+  // 1. Manual SOS Override Check (Hazard + Cancel simultaneously)
+  if (receivedData.clickHazard && receivedData.clickCancel) {
+    if (currentState == STATE_SOS) {
+      currentState = STATE_OFF;
+      Serial.println("SOS Cancelled via Remote Control");
+      return; // Stop processing further inputs for this packet
+    }
+  }
+
+  // 2. Ignore all other incoming wireless commands if currently in SOS mode
+  if (currentState == STATE_SOS) return;
+
+  // 3. Normal State Processing
   if (receivedData.clickLeft) currentState = STATE_LEFT;
   if (receivedData.clickRight) currentState = STATE_RIGHT;
   if (receivedData.clickCancel) currentState = STATE_OFF;
@@ -106,14 +140,14 @@ void onDataRecv(const esp_now_recv_info_t * info, const uint8_t *data, int len) 
 void initMPU6500() {
   Wire.begin(sdaPin, sclPin);
   Wire.beginTransmission(MPU_ADDR);
-  Wire.write(0x6B); 
-  Wire.write(0);    
+  Wire.write(0x6B); // PWR_MGMT_1 register
+  Wire.write(0);    // Wake up the MPU6500
   Wire.endTransmission(true);
 }
 
 void readAccelData(float &gX, float &gY, float &gZ) {
   Wire.beginTransmission(MPU_ADDR);
-  Wire.write(0x3B); 
+  Wire.write(0x3B); // ACCEL_XOUT_H register
   Wire.endTransmission(false);
   Wire.requestFrom(MPU_ADDR, 6, true);
   
@@ -121,6 +155,7 @@ void readAccelData(float &gX, float &gY, float &gZ) {
   int16_t rawY = Wire.read() << 8 | Wire.read();
   int16_t rawZ = Wire.read() << 8 | Wire.read();
   
+  // Convert raw values to G-force (Default sensitivity is +/- 2g -> 16384 LSB/g)
   gX = rawX / 16384.0;
   gY = rawY / 16384.0;
   gZ = rawZ / 16384.0;
@@ -129,6 +164,7 @@ void readAccelData(float &gX, float &gY, float &gZ) {
 void setup() {
   Serial.begin(115200);
   
+  // Initialize Pins
   pinMode(ledLeft, OUTPUT);
   pinMode(ledRight, OUTPUT);
   pinMode(ledLamp, OUTPUT);
@@ -143,66 +179,82 @@ void setup() {
   digitalWrite(buzzerLeft, LOW);
   digitalWrite(buzzerRight, LOW);
 
+  // Initialize Hardware
   initMPU6500();
 
+  // Initialize ESP-NOW
   WiFi.mode(WIFI_MODE_STA);
   esp_now_init();
   esp_now_register_recv_cb(onDataRecv);
 
-  // --- INICIALIZACIÓN BLE ---
+  // --- INITIALIZE BLE ---
   BLEDevice::init("EL4X-ESP32-C3");
   pServer = BLEDevice::createServer();
   pServer->setCallbacks(new MyServerCallbacks());
 
   BLEService *pService = pServer->createService(SERVICE_UUID);
 
+  // Create Characteristic with Read, Notify, and Write permissions
   pCharacteristic = pService->createCharacteristic(
                       CHARACTERISTIC_UUID,
                       BLECharacteristic::PROPERTY_READ   |
-                      BLECharacteristic::PROPERTY_NOTIFY
+                      BLECharacteristic::PROPERTY_NOTIFY |
+                      BLECharacteristic::PROPERTY_WRITE 
                     );
 
-  // Descriptor necesario para que el celular reciba notificaciones push
-  pCharacteristic->addDescriptor(new BLE2902());
+  // Set the callback to listen for messages from the phone
+  pCharacteristic->setCallbacks(new MyCharacteristicCallbacks());
 
+  // Descriptor required for push notifications
+  pCharacteristic->addDescriptor(new BLE2902());
+  
   pService->start();
   
+  // Start Advertising
   BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
   pAdvertising->addServiceUUID(SERVICE_UUID);
   pAdvertising->setScanResponse(true);
   pAdvertising->setMinPreferred(0x06); 
   pAdvertising->setMinPreferred(0x12);
   BLEDevice::startAdvertising();
+  
+  Serial.println("System Ready. Waiting for connections...");
 }
 
 void loop() {
+  // Read physical data from the accelerometer
   float gX, gY, gZ;
   readAccelData(gX, gY, gZ);
 
+  // 1. SOS / CRASH DETECTION LOGIC
   float gTotal = sqrt(gX * gX + gY * gY + gZ * gZ);
   
-  // 1. SOS / CRASH DETECTION LOGIC
   if (gTotal > CRASH_THRESHOLD) {
+    // Lock into SOS state
     if (currentState != STATE_SOS) {
       currentState = STATE_SOS;
-      sosIndex = 0; 
+      sosIndex = 0; // Reset SOS sequence
       previousSosTime = millis();
+      Serial.println("CRASH DETECTED! SOS Mode Activated.");
 
-      // --- ENVIAR ALERTA BLE AL CELULAR ---
+      // Send BLE Alert to the mobile app
       if (deviceConnected) {
         pCharacteristic->setValue("CRASH");
-        pCharacteristic->notify(); // Dispara la notificación en la app
+        pCharacteristic->notify(); 
+        Serial.println("BLE: Crash payload sent to app.");
       }
     }
   }
 
-  // 2. STOP LIGHT LOGIC
+  // 2. STOP LIGHT LOGIC (Braking)
   if (currentState != STATE_SOS) {
     if (gY > BRAKE_THRESHOLD || gY < -BRAKE_THRESHOLD) {
       digitalWrite(ledStop, HIGH);
     } else {
       digitalWrite(ledStop, LOW);
     }
+    
+    // Normal lamp control
     digitalWrite(ledLamp, isLampOn ? HIGH : LOW);
   }
 
@@ -210,12 +262,17 @@ void loop() {
   unsigned long currentTime = millis();
   
   if (currentState == STATE_SOS) {
+    // SOS Morse Code Sequence Execution
     if (currentTime - previousSosTime >= sosPattern[sosIndex]) {
       previousSosTime = currentTime;
       sosIndex++;
-      if (sosIndex >= sosPatternLength) sosIndex = 0; 
+      
+      if (sosIndex >= sosPatternLength) {
+        sosIndex = 0; // Loop the SOS sequence
+      }
     }
     
+    // Even indices (0, 2, 4...) are ON states, Odd indices (1, 3, 5...) are OFF states
     bool currentSosState = (sosIndex % 2 == 0); 
     
     digitalWrite(ledLeft, currentSosState);
@@ -226,6 +283,7 @@ void loop() {
     digitalWrite(buzzerRight, currentSosState);
     
   } else {
+    // Normal directional blinking logic
     if (currentTime - previousTime >= blinkInterval) {
       previousTime = currentTime;
       flashState = !flashState;
