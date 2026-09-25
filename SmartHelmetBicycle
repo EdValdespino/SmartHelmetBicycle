@@ -1,78 +1,80 @@
 #include <esp_now.h>
 #include <WiFi.h>
 
-uint8_t macReceptor[] = {0x9C, 0xCC, 0x01, 0x7C, 0x46, 0x3C};
+uint8_t receiverMac[] = {0x9C, 0xCC, 0x01, 0x7C, 0x46, 0x3C};
 
-// Pines más seguros para el C3 SuperMini
-const int btnIzq = 0;
-const int btnDer = 1;
-const int btnCancelar = 2;
-const int btnLampara = 3;
+// Pins for buttons
+const int btnLeft = 0;
+const int btnRight = 1;
+const int btnCancel = 2;
+const int btnLamp = 3;
 const int btnHazard = 4;
 
-bool estadoAnteriorIzq = HIGH, estadoAnteriorDer = HIGH;
-bool estadoAnteriorCan = HIGH, estadoAnteriorLamp = HIGH, estadoAnteriorHaz = HIGH;
+// Previous state variables to detect clicks
+bool prevLeft = HIGH, prevRight = HIGH;
+bool prevCancel = HIGH, prevLamp = HIGH, prevHazard = HIGH;
 
-typedef struct mensaje_control {
-  bool clickIzq;
-  bool clickDer;
-  bool clickCancelar;
-  bool clickLampara;
+// Data structure (Must match the receiver exactly)
+typedef struct control_message {
+  bool clickLeft;
+  bool clickRight;
+  bool clickCancel;
+  bool clickLamp;
   bool clickHazard;
-} mensaje_control;
+} control_message;
 
-mensaje_control datosEnviar;
-esp_now_peer_info_t infoReceptor;
+control_message sendData;
+esp_now_peer_info_t peerInfo;
 
-void alEnviarDatos(const uint8_t *mac_addr, esp_now_send_status_t status) {
-  // Función de confirmación silenciosa
+void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  // Silent confirmation
 }
 
 void setup() {
   Serial.begin(115200);
   
-  pinMode(btnIzq, INPUT_PULLUP);
-  pinMode(btnDer, INPUT_PULLUP);
-  pinMode(btnCancelar, INPUT_PULLUP);
-  pinMode(btnLampara, INPUT_PULLUP);
+  pinMode(btnLeft, INPUT_PULLUP);
+  pinMode(btnRight, INPUT_PULLUP);
+  pinMode(btnCancel, INPUT_PULLUP);
+  pinMode(btnLamp, INPUT_PULLUP);
   pinMode(btnHazard, INPUT_PULLUP);
 
   WiFi.mode(WIFI_MODE_STA);
   esp_now_init();
-  esp_now_register_send_cb((esp_now_send_cb_t)alEnviarDatos);
+  esp_now_register_send_cb((esp_now_send_cb_t)onDataSent);
 
-  memcpy(infoReceptor.peer_addr, macReceptor, 6);
-  infoReceptor.channel = 0;  
-  infoReceptor.encrypt = false;
-  esp_now_add_peer(&infoReceptor);
+  memcpy(peerInfo.peer_addr, receiverMac, 6);
+  peerInfo.channel = 0;  
+  peerInfo.encrypt = false;
+  esp_now_add_peer(&peerInfo);
 }
 
 void loop() {
-  bool actualIzq = digitalRead(btnIzq);
-  bool actualDer = digitalRead(btnDer);
-  bool actualCan = digitalRead(btnCancelar);
-  bool actualLamp = digitalRead(btnLampara);
-  bool actualHaz = digitalRead(btnHazard);
+  bool currLeft = digitalRead(btnLeft);
+  bool currRight = digitalRead(btnRight);
+  bool currCancel = digitalRead(btnCancel);
+  bool currLamp = digitalRead(btnLamp);
+  bool currHazard = digitalRead(btnHazard);
 
-  bool enviar = false;
-  datosEnviar = {false, false, false, false, false};
+  bool sendFlag = false;
+  sendData = {false, false, false, false, false};
 
-  if (actualIzq == LOW && estadoAnteriorIzq == HIGH) { datosEnviar.clickIzq = true; enviar = true; }
-  if (actualDer == LOW && estadoAnteriorDer == HIGH) { datosEnviar.clickDer = true; enviar = true; }
-  if (actualCan == LOW && estadoAnteriorCan == HIGH) { datosEnviar.clickCancelar = true; enviar = true; }
-  if (actualLamp == LOW && estadoAnteriorLamp == HIGH) { datosEnviar.clickLampara = true; enviar = true; }
-  if (actualHaz == LOW && estadoAnteriorHaz == HIGH) { datosEnviar.clickHazard = true; enviar = true; }
+  if (currLeft == LOW && prevLeft == HIGH) { sendData.clickLeft = true; sendFlag = true; }
+  if (currRight == LOW && prevRight == HIGH) { sendData.clickRight = true; sendFlag = true; }
+  if (currCancel == LOW && prevCancel == HIGH) { sendData.clickCancel = true; sendFlag = true; }
+  if (currLamp == LOW && prevLamp == HIGH) { sendData.clickLamp = true; sendFlag = true; }
+  if (currHazard == LOW && prevHazard == HIGH) { sendData.clickHazard = true; sendFlag = true; }
 
-  if (enviar) {
-    esp_now_send(macReceptor, (uint8_t *) &datosEnviar, sizeof(datosEnviar));
-    delay(200); 
+  if (sendFlag) {
+    esp_now_send(receiverMac, (uint8_t *) &sendData, sizeof(sendData));
+    delay(200); // Debounce delay
   }
 
-  estadoAnteriorIzq = actualIzq;
-  estadoAnteriorDer = actualDer;
-  estadoAnteriorCan = actualCan;
-  estadoAnteriorLamp = actualLamp;
-  estadoAnteriorHaz = actualHaz;
+  prevLeft = currLeft;
+  prevRight = currRight;
+  prevCancel = currCancel;
+  prevLamp = currLamp;
+  prevHazard = currHazard;
 
   delay(10);
 }
