@@ -2,32 +2,28 @@
 #include <WiFi.h>
 #include <Wire.h>
 #include <math.h>
-
-// BLE Libraries
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
-#include <string>
 
-// MPU6500 I2C Address
 const int MPU_ADDR = 0x68;
-
-// I2C Pins for ESP32-C3 Super Mini
-const int sdaPin = 10;
 const int sclPin = 9;
+const int sdaPin = 10;
+const float BRAKE_THRESHOLD = 0.4; 
+const float CRASH_THRESHOLD = 2.5; 
 
-// LED Pins
+const int pinBattery = 0; // ADC1
+const int ledPower = 1;
+const int ledEspNow = 2;
+const int ledBLE = 3;
 const int ledLeft = 4;
+const int buzzerLeft = 5;
 const int ledRight = 6;
 const int ledLamp = 7;
+const int buzzerRight = 20; 
 const int ledStop = 21;
 
-// Buzzer Pins
-const int buzzerLeft = 5;
-const int buzzerRight = 8;
-
-// Data structure 
 typedef struct control_message {
   bool clickLeft;
   bool clickRight;
@@ -37,172 +33,134 @@ typedef struct control_message {
   uint8_t batteryPercent; 
 } control_message;
 
-control_message receivedData;
+// --- NUEVA ESTRUCTURA PARA ENVIAR AL CONTROL ---
+typedef struct helmet_message {
+  bool isSOS;
+} helmet_message;
 
-// State machine including the SOS state
+control_message receivedData;
+helmet_message helmetData;
+
 enum DirectionState { STATE_OFF, STATE_LEFT, STATE_RIGHT, STATE_HAZARD, STATE_SOS };
 DirectionState currentState = STATE_OFF;
 
 bool isLampOn = false;
+uint8_t remoteBattery = 0;
+uint8_t helmetBattery = 0;
 
-// Timer variables for normal blinking
 unsigned long previousTime = 0;
+unsigned long lastEspNowRecv = 0;
+unsigned long lastBleSend = 0;
+unsigned long prevBleBlink = 0;
+unsigned long prevStrobeTime = 0; // Temporizador para el estrobo de freno
 const int blinkInterval = 400;
 bool flashState = false;
+bool bleBlinkState = LOW;
+bool strobeState = LOW;
 
-// SOS Morse Code Variables
-const int sosPattern[] = {
-  150, 150, 150, 150, 150, 450, // S: 3 short flashes + letter gap
-  450, 150, 450, 150, 450, 450, // O: 3 long flashes + letter gap
-  150, 150, 150, 150, 150, 1400 // S: 3 short flashes + word gap
-};
+const int sosPattern[] = {150, 150, 150, 150, 150, 450, 450, 150, 450, 150, 450, 450, 150, 150, 150, 150, 150, 1400};
 const int sosPatternLength = 18;
 int sosIndex = 0;
 unsigned long previousSosTime = 0;
 
-// Thresholds for MPU6500
-const float BRAKE_THRESHOLD = 0.4; 
-const float CRASH_THRESHOLD = 2.5; 
-
-// --- BLE VARIABLES ---
 BLEServer* pServer = NULL;
 BLECharacteristic* pCharacteristic = NULL;
 bool deviceConnected = false;
 
+// Variables de Pareo Dinámico (ESP-NOW)
+esp_now_peer_info_t remotePeerInfo;
+bool remotePaired = false;
+
 #define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 
-// BLE Connection Callbacks
 class MyServerCallbacks: public BLEServerCallbacks {
-    void onConnect(BLEServer* pServer) {
-      deviceConnected = true;
-      Serial.println("BLE: Mobile device connected");
-    };
-    void onDisconnect(BLEServer* pServer) {
-      deviceConnected = false;
-      Serial.println("BLE: Mobile device disconnected");
-      BLEDevice::startAdvertising(); 
-    }
+    void onConnect(BLEServer* pServer) { deviceConnected = true; };
+    void onDisconnect(BLEServer* pServer) { deviceConnected = false; BLEDevice::startAdvertising(); }
 };
 
-// BLE Incoming Data Callbacks (From Mobile App)
 class MyCharacteristicCallbacks: public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic *pChar) {
       String rxValue = pChar->getValue();
-      
-      if (rxValue.length() > 0) {
-        if (rxValue.indexOf("CANCEL_ALARM") != -1) {
-          if (currentState == STATE_SOS) {
-            currentState = STATE_OFF; 
-            Serial.println("SOS Cancelled via Mobile App");
-          }
-        }
+      if (rxValue.indexOf("CANCEL_ALARM") != -1 && currentState == STATE_SOS) {
+          currentState = STATE_OFF; 
+          helmetData.isSOS = false;
+          if (remotePaired) esp_now_send(remotePeerInfo.peer_addr, (uint8_t *) &helmetData, sizeof(helmetData));
       }
     }
 };
 
-// ESP-NOW Receive Callback (¡AQUÍ ESTÁ LA MAGIA NUEVA!)
-void onDataRecv(const esp_now_recv_info_t * info, const uint8_t *data, int len) {
-  memcpy(&receivedData, data, sizeof(receivedData));
+void onDataRecv(const esp_now_recv_info_t * info, const uint8_t *incomingData, int len) {
+  // Emparejamiento Automático para responderle al control
+  if (!remotePaired) {
+    memcpy(remotePeerInfo.peer_addr, info->src_addr, 6);
+    remotePeerInfo.channel = 0;
+    remotePeerInfo.encrypt = false;
+    esp_now_add_peer(&remotePeerInfo);
+    remotePaired = true;
+  }
 
-  // 1. Manual SOS Override Check (Hazard + Cancel simultaneously)
-  if (receivedData.clickHazard && receivedData.clickCancel) {
-    if (currentState == STATE_SOS) {
-      currentState = STATE_OFF;
-      Serial.println("SOS Cancelled via Remote Control");
-      
-      // NUEVO: Enviar la confirmación por BLE a la aplicación móvil
-      if (deviceConnected) {
-        // Usamos el mismo texto "CANCEL_ALARM" (puedes cambiarlo si tu app espera otra palabra)
-        pCharacteristic->setValue("CANCEL_ALARM");
-        pCharacteristic->notify();
-        Serial.println("BLE: Señal de cancelación enviada a la App.");
+  if (len == sizeof(control_message)) {
+    memcpy(&receivedData, incomingData, sizeof(receivedData));
+    remoteBattery = receivedData.batteryPercent;
+    lastEspNowRecv = millis();
+
+    if (receivedData.clickHazard && receivedData.clickCancel) {
+      if (currentState == STATE_SOS) {
+        currentState = STATE_OFF;
+        helmetData.isSOS = false;
+        esp_now_send(remotePeerInfo.peer_addr, (uint8_t *) &helmetData, sizeof(helmetData));
+        return; 
       }
-      
-      return; // Detenemos el procesamiento para que no se activen otras luces
     }
-  }
 
-  // 2. Ignore all other incoming wireless commands if currently in SOS mode
-  if (currentState == STATE_SOS) return;
+    if (currentState == STATE_SOS) return;
 
-  // 3. Normal State Processing
-  if (receivedData.clickLeft) currentState = STATE_LEFT;
-  if (receivedData.clickRight) currentState = STATE_RIGHT;
-  if (receivedData.clickCancel) currentState = STATE_OFF;
-  
-  if (receivedData.clickLamp) {
-    isLampOn = !isLampOn;
-  }
-  
-  if (receivedData.clickHazard) {
-    if (currentState == STATE_HAZARD) {
-      currentState = STATE_OFF;
-    } else {
-      currentState = STATE_HAZARD;
-    }
+    if (receivedData.clickLeft) currentState = STATE_LEFT;
+    if (receivedData.clickRight) currentState = STATE_RIGHT;
+    if (receivedData.clickCancel) currentState = STATE_OFF;
+    if (receivedData.clickLamp) isLampOn = !isLampOn; 
+    if (receivedData.clickHazard) currentState = (currentState == STATE_HAZARD) ? STATE_OFF : STATE_HAZARD;
   }
 }
 
 void initMPU6500() {
   Wire.begin(sdaPin, sclPin);
   Wire.beginTransmission(MPU_ADDR);
-  Wire.write(0x6B); 
-  Wire.write(0);    
-  Wire.endTransmission(true);
+  Wire.write(0x6B); Wire.write(0); Wire.endTransmission(true);
 }
 
 void readAccelData(float &gX, float &gY, float &gZ) {
   Wire.beginTransmission(MPU_ADDR);
-  Wire.write(0x3B); 
-  Wire.endTransmission(false);
+  Wire.write(0x3B); Wire.endTransmission(false);
   Wire.requestFrom(MPU_ADDR, 6, true);
-  
   int16_t rawX = Wire.read() << 8 | Wire.read();
   int16_t rawY = Wire.read() << 8 | Wire.read();
   int16_t rawZ = Wire.read() << 8 | Wire.read();
-  
-  gX = rawX / 16384.0;
-  gY = rawY / 16384.0;
-  gZ = rawZ / 16384.0;
+  gX = rawX / 16384.0; gY = rawY / 16384.0; gZ = rawZ / 16384.0;
 }
 
 void setup() {
   Serial.begin(115200);
   
-  pinMode(ledLeft, OUTPUT);
-  pinMode(ledRight, OUTPUT);
-  pinMode(ledLamp, OUTPUT);
-  pinMode(ledStop, OUTPUT);
-  pinMode(buzzerLeft, OUTPUT);
-  pinMode(buzzerRight, OUTPUT);
+  pinMode(ledPower, OUTPUT); pinMode(ledEspNow, OUTPUT); pinMode(ledBLE, OUTPUT);
+  pinMode(ledLeft, OUTPUT); pinMode(ledRight, OUTPUT); pinMode(ledLamp, OUTPUT);
+  pinMode(ledStop, OUTPUT); pinMode(buzzerLeft, OUTPUT); pinMode(buzzerRight, OUTPUT);
   
-  digitalWrite(ledLeft, LOW);
-  digitalWrite(ledRight, LOW);
-  digitalWrite(ledLamp, LOW);
-  digitalWrite(ledStop, LOW);
-  digitalWrite(buzzerLeft, LOW);
-  digitalWrite(buzzerRight, LOW);
-
+  digitalWrite(ledPower, HIGH); 
+  
+  analogReadResolution(12);
   initMPU6500();
 
   WiFi.mode(WIFI_MODE_STA);
   esp_now_init();
   esp_now_register_recv_cb(onDataRecv);
 
-  BLEDevice::init("EL4X-ESP32-C3");
+  BLEDevice::init("Casco-Inteligente");
   pServer = BLEDevice::createServer();
   pServer->setCallbacks(new MyServerCallbacks());
-
   BLEService *pService = pServer->createService(SERVICE_UUID);
-
-  pCharacteristic = pService->createCharacteristic(
-                      CHARACTERISTIC_UUID,
-                      BLECharacteristic::PROPERTY_READ   |
-                      BLECharacteristic::PROPERTY_NOTIFY |
-                      BLECharacteristic::PROPERTY_WRITE 
-                    );
-
+  pCharacteristic = pService->createCharacteristic(CHARACTERISTIC_UUID, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_WRITE);
   pCharacteristic->setCallbacks(new MyCharacteristicCallbacks());
   pCharacteristic->addDescriptor(new BLE2902());
   pService->start();
@@ -211,90 +169,94 @@ void setup() {
   pAdvertising->addServiceUUID(SERVICE_UUID);
   pAdvertising->setScanResponse(true);
   pAdvertising->setMinPreferred(0x06); 
-  pAdvertising->setMinPreferred(0x12);
   BLEDevice::startAdvertising();
-  
-  Serial.println("System Ready. Waiting for connections...");
 }
 
 void loop() {
+  unsigned long currentTime = millis();
+
+  int adcValue = analogRead(pinBattery);
+  float batVoltage = ((adcValue * 3.3) / 4095.0) * 2.0; 
+  helmetBattery = constrain((batVoltage - 3.2) * 100.0 / (4.2 - 3.2), 0, 100);
+
+  if (currentTime - lastEspNowRecv < 15000 && lastEspNowRecv > 0) {
+    digitalWrite(ledEspNow, HIGH); 
+  } else { digitalWrite(ledEspNow, LOW); }
+
+  if (deviceConnected) {
+    digitalWrite(ledBLE, HIGH); 
+  } else {
+    if (currentTime - prevBleBlink >= 800) {
+      prevBleBlink = currentTime;
+      bleBlinkState = !bleBlinkState;
+      digitalWrite(ledBLE, bleBlinkState); 
+    }
+  }
+
+  if (deviceConnected && (currentTime - lastBleSend >= 5000) && currentState != STATE_SOS) {
+    lastBleSend = currentTime;
+    String payload = "H_BAT:" + String(helmetBattery) + ",R_BAT:" + String(remoteBattery);
+    pCharacteristic->setValue(payload.c_str());
+    pCharacteristic->notify();
+  }
+
   float gX, gY, gZ;
   readAccelData(gX, gY, gZ);
-
   float gTotal = sqrt(gX * gX + gY * gY + gZ * gZ);
   
   if (gTotal > CRASH_THRESHOLD) {
     if (currentState != STATE_SOS) {
       currentState = STATE_SOS;
       sosIndex = 0; 
-      previousSosTime = millis();
-      Serial.println("CRASH DETECTED! SOS Mode Activated.");
-
-      if (deviceConnected) {
-        pCharacteristic->setValue("CRASH");
-        pCharacteristic->notify(); 
-        Serial.println("BLE: Crash payload sent to app.");
-      }
+      previousSosTime = currentTime;
+      
+      // Avisarle al celular y al Control Remoto
+      if (deviceConnected) { pCharacteristic->setValue("CRASH"); pCharacteristic->notify(); }
+      helmetData.isSOS = true;
+      if (remotePaired) esp_now_send(remotePeerInfo.peer_addr, (uint8_t *) &helmetData, sizeof(helmetData));
     }
   }
 
+  // --- NUEVA LÓGICA DE FRENO ESTROBOSCÓPICO ---
   if (currentState != STATE_SOS) {
     if (gY > BRAKE_THRESHOLD || gY < -BRAKE_THRESHOLD) {
-      digitalWrite(ledStop, HIGH);
+      // Freno brusco detectado: Parpadeo muy rápido (Estrobo)
+      if (currentTime - prevStrobeTime >= 50) {
+        prevStrobeTime = currentTime;
+        strobeState = !strobeState;
+        digitalWrite(ledStop, strobeState);
+      }
     } else {
-      digitalWrite(ledStop, LOW);
+      // Marcha normal: Luz de posición fija encendida
+      digitalWrite(ledStop, HIGH);
     }
     digitalWrite(ledLamp, isLampOn ? HIGH : LOW);
   }
 
-  unsigned long currentTime = millis();
-  
   if (currentState == STATE_SOS) {
     if (currentTime - previousSosTime >= sosPattern[sosIndex]) {
-      previousSosTime = currentTime;
-      sosIndex++;
-      if (sosIndex >= sosPatternLength) {
-        sosIndex = 0; 
-      }
+      previousSosTime = currentTime; sosIndex++;
+      if (sosIndex >= sosPatternLength) sosIndex = 0;
     }
-    
     bool currentSosState = (sosIndex % 2 == 0); 
-    
-    digitalWrite(ledLeft, currentSosState);
-    digitalWrite(ledRight, currentSosState);
-    digitalWrite(ledStop, currentSosState);
-    digitalWrite(ledLamp, currentSosState);
-    digitalWrite(buzzerLeft, currentSosState);
-    digitalWrite(buzzerRight, currentSosState);
-    
+    digitalWrite(ledLeft, currentSosState); digitalWrite(ledRight, currentSosState);
+    digitalWrite(ledStop, currentSosState); digitalWrite(ledLamp, currentSosState);
+    digitalWrite(buzzerLeft, currentSosState); digitalWrite(buzzerRight, currentSosState);
   } else {
     if (currentTime - previousTime >= blinkInterval) {
-      previousTime = currentTime;
-      flashState = !flashState;
-
+      previousTime = currentTime; flashState = !flashState;
       if (currentState == STATE_LEFT) {
-        digitalWrite(ledLeft, flashState);
-        digitalWrite(buzzerLeft, flashState);
-        digitalWrite(ledRight, LOW);
-        digitalWrite(buzzerRight, LOW);
-      }
-      else if (currentState == STATE_RIGHT) {
-        digitalWrite(ledLeft, LOW);
-        digitalWrite(buzzerLeft, LOW);
-        digitalWrite(ledRight, flashState);
-        digitalWrite(buzzerRight, flashState);
-      }
-      else if (currentState == STATE_HAZARD) {
-        digitalWrite(ledLeft, flashState);
-        digitalWrite(ledRight, flashState);
-        digitalWrite(buzzerLeft, flashState);
-        digitalWrite(buzzerRight, flashState);
-      }
-      else if (currentState == STATE_OFF) {
-        digitalWrite(ledLeft, LOW);
-        digitalWrite(ledRight, LOW);
-        digitalWrite(buzzerLeft, LOW);
-        digitalWrite(buzzerRight, LOW);
+        digitalWrite(ledLeft, flashState); digitalWrite(buzzerLeft, flashState);
+        digitalWrite(ledRight, LOW); digitalWrite(buzzerRight, LOW);
+      } else if (currentState == STATE_RIGHT) {
+        digitalWrite(ledLeft, LOW); digitalWrite(buzzerLeft, LOW);
+        digitalWrite(ledRight, flashState); digitalWrite(buzzerRight, flashState);
+      } else if (currentState == STATE_HAZARD) {
+        digitalWrite(ledLeft, flashState); digitalWrite(ledRight, flashState);
+        digitalWrite(buzzerLeft, flashState); digitalWrite(buzzerRight, flashState);
+      } else if (currentState == STATE_OFF) {
+        digitalWrite(ledLeft, LOW); digitalWrite(ledRight, LOW);
+        digitalWrite(buzzerLeft, LOW); digitalWrite(buzzerRight, LOW);
       }
     }
   }
